@@ -45,6 +45,29 @@ type ResolveState struct {
 	MaxRounds int `json:"maxRounds"`
 	// 用户澄清答复累积（Resume 重跑时注入）；优先据此消歧
 	Clarifications []string `json:"clarifications,omitempty"`
+	// 仅由 namespace 歧义挂起后用户的直接答复写入，避免把其它问题的回答误当成 namespace 选择
+	NamespaceSelection string `json:"namespaceSelection,omitempty"`
+	// 同名资源跨多个 kind 重复时，namespace 选择同时绑定的资源类型
+	NamespaceSelectionKind     string `json:"namespaceSelectionKind,omitempty"`
+	NamespaceSelectionAPIGroup string `json:"namespaceSelectionApiGroup,omitempty"`
+	// 已确认的 namespace 选择按问题节点与资源名绑定，避免影响同次请求里的其它目标
+	NamespaceSelections []NamespaceSelection `json:"namespaceSelections,omitempty"`
+	// 当前待答复的歧义目标身份
+	NamespaceSelectionTargetNodeID   string `json:"namespaceSelectionTargetNodeId,omitempty"`
+	NamespaceSelectionTargetName     string `json:"namespaceSelectionTargetName,omitempty"`
+	NamespaceSelectionTargetKind     string `json:"namespaceSelectionTargetKind,omitempty"`
+	NamespaceSelectionTargetAPIGroup string `json:"namespaceSelectionTargetApiGroup,omitempty"`
+	// 非空时表示下一条用户答复正等待选择 namespace
+	NamespaceSelectionOptions []string `json:"namespaceSelectionOptions,omitempty"`
+}
+
+// NamespaceSelection binds a user's explicit choice to one parsed resource.
+type NamespaceSelection struct {
+	NodeID    string `json:"nodeId"`
+	Name      string `json:"name"`
+	Kind      string `json:"kind,omitempty"`
+	APIGroup  string `json:"apiGroup,omitempty"`
+	Namespace string `json:"namespace"`
 }
 
 // 定位驱动向用户澄清的请求内容
@@ -53,6 +76,11 @@ type ClarifyRequest struct {
 	Question string `json:"question"`
 	// 可选候选列表，可空
 	Options []string `json:"options,omitempty"`
+	// namespace 歧义时标识需要用户选择的具体目标
+	TargetNodeID   string `json:"targetNodeId,omitempty"`
+	TargetName     string `json:"targetName,omitempty"`
+	TargetKind     string `json:"targetKind,omitempty"`
+	TargetAPIGroup string `json:"targetApiGroup,omitempty"`
 }
 
 // 定位驱动提议的一次工具调用，尚未分配任务编号

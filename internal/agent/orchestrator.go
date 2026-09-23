@@ -531,6 +531,63 @@ func (o *Orchestrator) Resume(ctx context.Context, runID, answer string) (core.O
 	switch snap.Stage {
 	case core.StageResolve:
 		state := snap.Resolve
+		if len(state.NamespaceSelectionOptions) > 0 {
+			selected := parseNamespaceSelection(answer, state.NamespaceSelectionOptions)
+			if selected == "" {
+				// 不接受无效或同时命中多个候选的答复；保留挂起态，等待明确选择。
+				o.putSuspendedRun(snap)
+				return core.Outcome{Suspension: &core.Suspension{
+					RunID:     snap.Run.ID,
+					SessionID: snap.Run.SessionID,
+					Stage:     core.StageResolve,
+					Question:  snap.Clarify.Question,
+					Options:   slices.Clone(snap.Clarify.Options),
+				}}, nil
+			}
+			if strings.Contains(selected, "/") {
+				parts := strings.SplitN(selected, "/", 2)
+				state.NamespaceSelectionKind, state.NamespaceSelectionAPIGroup = splitKindAndAPIGroup(parts[0])
+				state.NamespaceSelection = parts[1]
+			} else {
+				state.NamespaceSelectionKind = normalizeKind(state.NamespaceSelectionTargetKind)
+				state.NamespaceSelectionAPIGroup = normalizeAPIGroup(state.NamespaceSelectionTargetAPIGroup)
+				state.NamespaceSelection = selected
+			}
+			if state.NamespaceSelectionKind == "" {
+				state.NamespaceSelectionKind = normalizeKind(state.NamespaceSelectionTargetKind)
+			}
+			if state.NamespaceSelectionAPIGroup == "" {
+				state.NamespaceSelectionAPIGroup = normalizeAPIGroup(state.NamespaceSelectionTargetAPIGroup)
+			}
+			if state.NamespaceSelectionTargetNodeID != "" && state.NamespaceSelectionTargetName != "" {
+				binding := NamespaceSelection{
+					NodeID:    state.NamespaceSelectionTargetNodeID,
+					Name:      state.NamespaceSelectionTargetName,
+					Kind:      normalizeKind(state.NamespaceSelectionKind),
+					APIGroup:  normalizeAPIGroup(state.NamespaceSelectionAPIGroup),
+					Namespace: state.NamespaceSelection,
+				}
+				updated := false
+				for index := range state.NamespaceSelections {
+					if state.NamespaceSelections[index].NodeID == binding.NodeID &&
+						normalizeObjectName(state.NamespaceSelections[index].Name) == normalizeObjectName(binding.Name) &&
+						normalizeKind(state.NamespaceSelections[index].Kind) == normalizeKind(binding.Kind) &&
+						normalizeAPIGroup(state.NamespaceSelections[index].APIGroup) == normalizeAPIGroup(binding.APIGroup) {
+						state.NamespaceSelections[index] = binding
+						updated = true
+						break
+					}
+				}
+				if !updated {
+					state.NamespaceSelections = append(state.NamespaceSelections, binding)
+				}
+			}
+			state.NamespaceSelectionTargetNodeID = ""
+			state.NamespaceSelectionTargetName = ""
+			state.NamespaceSelectionTargetKind = ""
+			state.NamespaceSelectionTargetAPIGroup = ""
+			state.NamespaceSelectionOptions = nil
+		}
 		state.Clarifications = append(slices.Clone(state.Clarifications), strings.TrimSpace(answer))
 		// 澄清后重跑定位：保留已取证据与任务，但重置轮次预算计数，避免触顶后无法消歧
 		// 证据/任务仍回喂驱动；Round 仅表示本段工具调用次数
@@ -750,8 +807,12 @@ func (o *Orchestrator) putResolveSuspended(run core.Run, query core.Query, clari
 		Stage:   core.StageResolve,
 		Resolve: cloneResolveState(state),
 		Clarify: ClarifyRequest{
-			Question: clarify.Question,
-			Options:  slices.Clone(clarify.Options),
+			Question:       clarify.Question,
+			Options:        slices.Clone(clarify.Options),
+			TargetNodeID:   clarify.TargetNodeID,
+			TargetName:     clarify.TargetName,
+			TargetKind:     clarify.TargetKind,
+			TargetAPIGroup: clarify.TargetAPIGroup,
 		},
 	}
 	o.putSuspendedRun(snap)
@@ -792,12 +853,21 @@ func (o *Orchestrator) takeSuspended(runID string) (*SuspensionSnapshot, bool) {
 // 复制定位状态中的切片字段，避免挂起快照与进行中状态共享底层数组
 func cloneResolveState(state ResolveState) ResolveState {
 	return ResolveState{
-		Query:          state.Query,
-		Tasks:          slices.Clone(state.Tasks),
-		Evidence:       slices.Clone(state.Evidence),
-		Round:          state.Round,
-		MaxRounds:      state.MaxRounds,
-		Clarifications: slices.Clone(state.Clarifications),
+		Query:                            state.Query,
+		Tasks:                            slices.Clone(state.Tasks),
+		Evidence:                         slices.Clone(state.Evidence),
+		Round:                            state.Round,
+		MaxRounds:                        state.MaxRounds,
+		Clarifications:                   slices.Clone(state.Clarifications),
+		NamespaceSelection:               state.NamespaceSelection,
+		NamespaceSelectionKind:           state.NamespaceSelectionKind,
+		NamespaceSelectionAPIGroup:       state.NamespaceSelectionAPIGroup,
+		NamespaceSelections:              slices.Clone(state.NamespaceSelections),
+		NamespaceSelectionTargetNodeID:   state.NamespaceSelectionTargetNodeID,
+		NamespaceSelectionTargetName:     state.NamespaceSelectionTargetName,
+		NamespaceSelectionTargetKind:     state.NamespaceSelectionTargetKind,
+		NamespaceSelectionTargetAPIGroup: state.NamespaceSelectionTargetAPIGroup,
+		NamespaceSelectionOptions:        slices.Clone(state.NamespaceSelectionOptions),
 	}
 }
 
@@ -1103,8 +1173,11 @@ func parseAPIResources(stdout string) []ClusterResource {
 			Namespaced: fields[nsIdx] == "true",
 			Kind:       fields[nsIdx+1],
 		}
-		if next := nsIdx + 2; next < len(fields) && strings.Contains(fields[next], "/") {
-			r.APIGroup = strings.SplitN(fields[next], "/", 2)[0]
+		for _, field := range fields {
+			if strings.Contains(field, "/") {
+				r.APIGroup = strings.SplitN(field, "/", 2)[0]
+				break
+			}
 		}
 		out = append(out, r)
 		if len(out) >= maxKeep {
@@ -1157,8 +1230,28 @@ func (o *Orchestrator) resolveLoop(
 				if err := o.applyToolCall(ctx, &state, call); err != nil {
 					return nil, nil, nil, ResolveState{}, err
 				}
+				if call.ToolName == "k8s" && isAllNamespaceGetArguments(call.Arguments) {
+					if ambiguity := namespaceAmbiguityForQuery(query, state); ambiguity != nil {
+						rememberNamespaceClarification(&state, ambiguity)
+						o.progressf("定位需澄清：%s", ambiguity.Question)
+						return nil, nil, ambiguity, cloneResolveState(state), nil
+					}
+				}
 			}
 		case ResolveActionSubmitTargets:
+			ambiguity, discoveryErr := o.discoverNamespaceAmbiguity(ctx, query, &state, action)
+			if discoveryErr != nil {
+				return nil, nil, nil, ResolveState{}, discoveryErr
+			}
+			if ambiguity != nil {
+				o.progressf("定位需澄清：%s", ambiguity.Question)
+				return nil, nil, ambiguity, cloneResolveState(state), nil
+			}
+			if ambiguity := namespaceAmbiguity(query, state, action); ambiguity != nil {
+				rememberNamespaceClarification(&state, ambiguity)
+				o.progressf("定位需澄清：%s", ambiguity.Question)
+				return nil, nil, ambiguity, cloneResolveState(state), nil
+			}
 			targets, mErr := o.materializeTargets(query, action, state)
 			if mErr != nil {
 				return nil, nil, nil, ResolveState{}, mErr

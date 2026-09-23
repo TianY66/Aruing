@@ -620,6 +620,160 @@ func TestTowerLLMCallToolThenReply(t *testing.T) {
 	}
 }
 
+func TestTowerSuspendsWhenAllNamespaceListFindsDuplicateResourceNames(t *testing.T) {
+	var llmCalls atomic.Int32
+	client := newMockLLMClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		llmCalls.Add(1)
+		writeChatCompletion(w, `{"action":"call_tool","tool_call":{"tool_name":"k8s","arguments":{"argv":["get","deployments","-A"]},"purpose":"跨 namespace 定位 demo-api"}}`)
+	})
+
+	registry := tools.NewRegistry()
+	if err := registry.Register(duplicateNamespaceK8sTool{}); err != nil {
+		t.Fatalf("register k8s: %v", err)
+	}
+	if err := registry.Register(toolstest.NewFakeListPodsTool()); err != nil {
+		t.Fatalf("register fake.list_pods: %v", err)
+	}
+	dispatcher := tools.NewDispatcher(registry, tools.NewReadonlyPolicy())
+	factory := core.NewFactory()
+	basePlanner := agenttest.NewFakePlanner(agent.Plan{
+		Hypotheses: []core.Hypothesis{{ID: "h1", Statement: "demo-api 镜像拉取失败"}},
+		Tasks:      []core.Task{{ID: "t1", Refs: []string{"h1"}, ToolName: "fake.list_pods"}},
+	})
+	planner := &namespaceTargetCapturingPlanner{inner: basePlanner}
+	resolver := &namespaceSelectingResolveDriver{namespace: "team-b"}
+	orchestrator := agent.NewOrchestrator(
+		agenttest.NewFakeParser(core.Query{
+			ID: "q_tower_namespace",
+			Nodes: []core.Node{{
+				ID:   "n_demo_api",
+				Type: "resource",
+				Text: "demo-api",
+				Attrs: map[string]string{
+					"k8s.name": "demo-api",
+				},
+			}},
+		}),
+		resolver,
+		planner,
+		dispatcher,
+		agenttest.NewFakeVerifier([]core.Verdict{{
+			HypothesisID: "h1",
+			Result:       core.VerdictSupported,
+			Reason:       "image cannot be pulled",
+		}}),
+		agenttest.NewFakeReporter(core.Report{ID: "r1", Summary: "diagnosis complete"}),
+		factory,
+	)
+	ledger := store.NewMemoryRunLedger()
+	tower, err := agent.NewTowerResponder(client, factory, orchestrator, ledger, dispatcher, registry.Specs(), nil)
+	if err != nil {
+		t.Fatalf("new tower: %v", err)
+	}
+	service := session.NewService(store.NewMemoryStore(), factory, tower)
+	sess, err := service.NewSession(context.Background())
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+
+	first, err := service.Turn(context.Background(), sess.ID, "demo-api 起不来是怎么回事")
+	if err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	if first.AssistantMessage.Mode != session.ModeClarify || first.RunID == "" {
+		t.Fatalf("first turn = %+v, want a suspended clarification", first)
+	}
+	if !strings.Contains(first.AssistantMessage.Content, "team-a") || !strings.Contains(first.AssistantMessage.Content, "team-b") {
+		t.Fatalf("clarification = %q, want both namespaces", first.AssistantMessage.Content)
+	}
+	if llmCalls.Load() != 1 {
+		t.Fatalf("tower LLM calls before clarification = %d, want 1", llmCalls.Load())
+	}
+	if len(planner.targets) != 0 {
+		t.Fatalf("diagnostic planner ran before clarification: %+v", planner.targets)
+	}
+
+	second, err := service.Turn(context.Background(), sess.ID, "team-a 的那个")
+	if err != nil {
+		t.Fatalf("clarification turn: %v", err)
+	}
+	if second.AssistantMessage.Mode != session.ModeDiagnostic {
+		t.Fatalf("second turn mode = %q, want diagnostic", second.AssistantMessage.Mode)
+	}
+	if len(planner.targets) != 1 || planner.targets[0].Attrs["k8s.namespace"] != "team-a" {
+		t.Fatalf("resumed target = %+v, want selected namespace team-a", planner.targets)
+	}
+	if llmCalls.Load() != 1 {
+		t.Fatalf("tower LLM calls after resume = %d, want no new baseline decision", llmCalls.Load())
+	}
+}
+
+type namespaceSelectingResolveDriver struct {
+	namespace string
+}
+
+func (d *namespaceSelectingResolveDriver) Next(_ context.Context, state agent.ResolveState) (agent.ResolveAction, error) {
+	if len(state.Query.Nodes) == 0 || len(state.Evidence) == 0 {
+		return agent.ResolveAction{Action: agent.ResolveActionFail, Error: "expected parsed target and seeded list evidence"}, nil
+	}
+	return agent.ResolveAction{
+		Action: agent.ResolveActionSubmitTargets,
+		Targets: []agent.ProposedTarget{{
+			NodeID: state.Query.Nodes[0].ID,
+			Type:   "k8s.resource",
+			Attrs: map[string]string{
+				"k8s.kind":      "Deployment",
+				"k8s.namespace": d.namespace,
+				"k8s.name":      "demo-api",
+			},
+			EvidenceIDs: []string{state.Evidence[0].ID},
+		}},
+	}, nil
+}
+
+type duplicateNamespaceK8sTool struct{}
+
+func (duplicateNamespaceK8sTool) Spec() tools.ToolSpec {
+	return tools.ToolSpec{
+		Name:        "k8s",
+		Description: "fake Kubernetes list with same-name objects in two namespaces",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}
+}
+
+func (duplicateNamespaceK8sTool) Execute(_ context.Context, args json.RawMessage) (*core.Evidence, error) {
+	var input struct {
+		Argv []string `json:"argv"`
+	}
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, err
+	}
+	stdout := "NAME           SHORTNAMES   APIVERSION   NAMESPACED   KIND\ndeployments    deploy       apps/v1      true         Deployment\n"
+	commandView := "kubectl api-resources"
+	if len(input.Argv) > 0 && input.Argv[0] == "get" {
+		stdout = "NAMESPACE  NAME                       READY   UP-TO-DATE   AVAILABLE   AGE\n" +
+			"team-a     deployment.apps/demo-api  1/1     1            1           2m\n" +
+			"team-b     deployment.apps/demo-api  0/1     1            0           2m\n"
+		commandView = "kubectl get deployments -A"
+	}
+	raw, err := json.Marshal(map[string]any{
+		"argv":     input.Argv,
+		"exitCode": 0,
+		"stdout":   stdout,
+		"stderr":   "",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &core.Evidence{
+		Source:      "kubernetes",
+		ToolName:    "k8s",
+		CommandView: commandView,
+		Summary:     "kubectl 执行完成，exitCode=0",
+		Raw:         raw,
+	}, nil
+}
+
 // 非法动作持续不合规应返回模型输出不一致错误
 func TestTowerLLMInvalidActionRetries(t *testing.T) {
 	var calls atomic.Int32

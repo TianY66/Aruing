@@ -378,6 +378,233 @@ func TestOrchestratorSuspendAndResume(t *testing.T) {
 	}
 }
 
+type ambiguousNamespaceResolveDriver struct {
+	clarifications [][]string
+}
+
+func (d *ambiguousNamespaceResolveDriver) Next(_ context.Context, state agent.ResolveState) (agent.ResolveAction, error) {
+	d.clarifications = append(d.clarifications, append([]string(nil), state.Clarifications...))
+	if len(state.Evidence) == 0 {
+		return agent.ResolveAction{
+			Action: agent.ResolveActionCallTool,
+			ToolCalls: []agent.ProposedToolCall{{
+				ToolName:  "k8s",
+				Arguments: json.RawMessage(`{"argv":["get","deployments","-A"]}`),
+				Purpose:   "列出所有 namespace 的 Deployment",
+			}},
+		}, nil
+	}
+
+	return agent.ResolveAction{
+		Action: agent.ResolveActionSubmitTargets,
+		Targets: []agent.ProposedTarget{{
+			NodeID:      state.Query.Nodes[0].ID,
+			Type:        "k8s.resource",
+			Attrs:       map[string]string{"k8s.kind": "Deployment", "k8s.namespace": "team-b", "k8s.name": "demo-api"},
+			EvidenceIDs: []string{state.Evidence[0].ID},
+		}},
+	}, nil
+}
+
+type ambiguousNamespaceListTool struct{}
+
+func (ambiguousNamespaceListTool) Spec() tools.ToolSpec {
+	return tools.ToolSpec{
+		Name:        "k8s",
+		Description: "fake namespace-wide Kubernetes list",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}
+}
+
+func (ambiguousNamespaceListTool) Execute(context.Context, json.RawMessage) (*core.Evidence, error) {
+	raw, err := json.Marshal(map[string]any{
+		"argv":     []string{"get", "deployments", "-A"},
+		"exitCode": 0,
+		"stdout": "NAMESPACE  NAME                       READY   UP-TO-DATE   AVAILABLE   AGE\n" +
+			"team-a     deployment.apps/demo-api  1/1     1            1           2m\n" +
+			"team-b     deployment.apps/demo-api  0/1     1            0           2m\n",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &core.Evidence{
+		Source:      "kubernetes",
+		ToolName:    "k8s",
+		CommandView: "kubectl get deployments -A",
+		Summary:     "找到了两个同名 Deployment",
+		Raw:         raw,
+	}, nil
+}
+
+type namespaceTargetCapturingPlanner struct {
+	inner   *agenttest.FakePlanner
+	targets []core.Target
+}
+
+func (p *namespaceTargetCapturingPlanner) Plan(ctx context.Context, state agent.PlanState) (agent.Plan, error) {
+	p.targets = append([]core.Target(nil), state.Targets...)
+	return p.inner.Plan(ctx, state)
+}
+
+func TestOrchestratorClarifiesDuplicateNamesAcrossNamespaces(t *testing.T) {
+	registry := tools.NewRegistry()
+	if err := registry.Register(ambiguousNamespaceListTool{}); err != nil {
+		t.Fatalf("register k8s tool: %v", err)
+	}
+	if err := registry.Register(toolstest.NewFakeListPodsTool()); err != nil {
+		t.Fatalf("register fake.list_pods: %v", err)
+	}
+
+	resolver := &ambiguousNamespaceResolveDriver{}
+	basePlanner := agenttest.NewFakePlanner(agent.Plan{
+		Hypotheses: []core.Hypothesis{{ID: "h1", Statement: "demo-api 无法启动"}},
+		Tasks:      []core.Task{{ID: "t1", Refs: []string{"h1"}, ToolName: "fake.list_pods"}},
+	})
+	planner := &namespaceTargetCapturingPlanner{inner: basePlanner}
+	orch := agent.NewOrchestrator(
+		agenttest.NewFakeParser(core.Query{
+			ID: "q_ambiguous",
+			Nodes: []core.Node{{
+				ID:   "n_demo_api",
+				Type: "resource",
+				Text: "demo-api",
+				Attrs: map[string]string{
+					"k8s.name": "demo-api",
+				},
+			}},
+		}),
+		resolver,
+		planner,
+		tools.NewDispatcher(registry, tools.NewReadonlyPolicy()),
+		agenttest.NewFakeVerifier([]core.Verdict{{
+			HypothesisID: "h1",
+			Result:       core.VerdictSupported,
+			Reason:       "image cannot be pulled",
+		}}),
+		agenttest.NewFakeReporter(core.Report{ID: "r1", Summary: "team-b/demo-api 诊断完成"}),
+		&testFactory{now: time.Now().UTC()},
+	)
+
+	out1, err := orch.Execute(context.Background(), core.Run{
+		ID:        "run_ambiguous",
+		SessionID: "sess_ambiguous",
+		Question:  "demo-api 起不来是怎么回事",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out1.Suspension == nil || out1.Report != nil {
+		t.Fatalf("want clarification before diagnosis, got %+v", out1)
+	}
+	if !strings.Contains(out1.Suspension.Question, "team-a") || !strings.Contains(out1.Suspension.Question, "team-b") {
+		t.Fatalf("clarification question = %q, want both candidate namespaces", out1.Suspension.Question)
+	}
+	if strings.Join(out1.Suspension.Options, ",") != "team-a,team-b" {
+		t.Fatalf("options = %v, want [team-a team-b]", out1.Suspension.Options)
+	}
+	if len(basePlanner.GotTargetCounts) != 0 {
+		t.Fatalf("planner ran before clarification: target counts %v", basePlanner.GotTargetCounts)
+	}
+
+	out2, err := orch.Resume(context.Background(), "run_ambiguous", "team-a 的那个")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if out2.Report == nil || out2.Suspension != nil {
+		t.Fatalf("want report after namespace clarification, got %+v", out2)
+	}
+	if len(resolver.clarifications) < 2 || len(resolver.clarifications[1]) != 1 || resolver.clarifications[1][0] != "team-a 的那个" {
+		t.Fatalf("resume clarifications = %+v, want team-a answer", resolver.clarifications)
+	}
+	if len(planner.targets) != 1 || planner.targets[0].Attrs["k8s.namespace"] != "team-a" {
+		t.Fatalf("resolved target = %+v, want namespace team-a from user clarification", planner.targets)
+	}
+}
+
+type directNamespaceSubmitDriver struct{}
+
+func (directNamespaceSubmitDriver) Next(_ context.Context, state agent.ResolveState) (agent.ResolveAction, error) {
+	return agent.ResolveAction{
+		Action: agent.ResolveActionSubmitTargets,
+		Targets: []agent.ProposedTarget{{
+			NodeID: state.Query.Nodes[0].ID,
+			Type:   "k8s.resource",
+			Attrs: map[string]string{
+				"k8s.kind":      "Deployment",
+				"k8s.namespace": "team-a",
+				"k8s.name":      "demo-api",
+			},
+		}},
+	}, nil
+}
+
+func TestOrchestratorChecksNamespacesBeforeDirectTargetSubmission(t *testing.T) {
+	registry := tools.NewRegistry()
+	if err := registry.Register(ambiguousNamespaceListTool{}); err != nil {
+		t.Fatalf("register k8s tool: %v", err)
+	}
+	if err := registry.Register(toolstest.NewFakeListPodsTool()); err != nil {
+		t.Fatalf("register fake.list_pods: %v", err)
+	}
+	basePlanner := agenttest.NewFakePlanner(agent.Plan{
+		Hypotheses: []core.Hypothesis{{ID: "h1", Statement: "demo-api 无法启动"}},
+		Tasks:      []core.Task{{ID: "t1", Refs: []string{"h1"}, ToolName: "fake.list_pods"}},
+	})
+	planner := &namespaceTargetCapturingPlanner{inner: basePlanner}
+	orch := agent.NewOrchestrator(
+		agenttest.NewFakeParser(core.Query{
+			ID: "q_direct_namespace",
+			Nodes: []core.Node{{
+				ID:   "n_demo_api",
+				Type: "resource",
+				Text: "demo-api",
+				Attrs: map[string]string{
+					"k8s.name": "demo-api",
+				},
+			}},
+		}),
+		directNamespaceSubmitDriver{},
+		planner,
+		tools.NewDispatcher(registry, tools.NewReadonlyPolicy()),
+		agenttest.NewFakeVerifier([]core.Verdict{{
+			HypothesisID: "h1",
+			Result:       core.VerdictSupported,
+			Reason:       "image cannot be pulled",
+		}}),
+		agenttest.NewFakeReporter(core.Report{ID: "r1", Summary: "namespace selection honored"}),
+		&testFactory{now: time.Now().UTC()},
+	)
+
+	out1, err := orch.Execute(context.Background(), core.Run{
+		ID:        "run_direct_namespace",
+		SessionID: "sess_direct_namespace",
+		Question:  "demo-api 起不来是怎么回事",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out1.Suspension == nil || out1.Report != nil {
+		t.Fatalf("expected a namespace question before diagnosis, got %+v", out1)
+	}
+	if strings.Join(out1.Suspension.Options, ",") != "team-a,team-b" {
+		t.Fatalf("namespace options = %v, want [team-a team-b]", out1.Suspension.Options)
+	}
+	if len(basePlanner.GotTargetCounts) != 0 {
+		t.Fatalf("planner ran before namespace choice: target counts %v", basePlanner.GotTargetCounts)
+	}
+
+	out2, err := orch.Resume(context.Background(), "run_direct_namespace", "team-b")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if out2.Report == nil || out2.Suspension != nil {
+		t.Fatalf("expected report after namespace choice, got %+v", out2)
+	}
+	if len(planner.targets) != 1 || planner.targets[0].Attrs["k8s.namespace"] != "team-b" {
+		t.Fatalf("resolved target = %+v, want namespace team-b", planner.targets)
+	}
+}
+
 // 无挂起快照时 Resume 失败
 func TestOrchestratorResumeMissing(t *testing.T) {
 	orch := agent.NewOrchestrator(

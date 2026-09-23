@@ -92,6 +92,15 @@ func (r *Registry) Get(name string) (Tool, error) {
 	return t, nil
 }
 
+// Has reports whether a tool name is registered.
+func (r *Registry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.tools[name]
+	return ok
+}
+
 // 返回已注册工具规格的稳定排序副本，调用方修改返回值不会影响注册表
 func (r *Registry) Specs() []ToolSpec {
 	if r == nil || len(r.tools) == 0 {
@@ -134,6 +143,11 @@ func NewDispatcher(r *Registry, policy Policy) *Dispatcher {
 		policy = NewAllowAllPolicy()
 	}
 	return &Dispatcher{registry: r, policy: policy}
+}
+
+// HasTool reports whether the dispatcher can route a task to the named tool.
+func (d *Dispatcher) HasTool(name string) bool {
+	return d != nil && d.registry != nil && d.registry.Has(name)
 }
 
 // 执行一个工具任务，返回产出的证据

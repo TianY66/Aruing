@@ -145,6 +145,7 @@ make lab-down NAME=crashloop-bad-image
 | --- | --- |
 | [`docs/architecture.md`](docs/architecture.md) | 架构事实：模块、数据模型、信任边界、硬约束 |
 | [`docs/project-state.md`](docs/project-state.md) | 阶段、工作单元、下一步 |
+| [`docs/namespace-ambiguity-fix.md`](docs/namespace-ambiguity-fix.md) | 跨 namespace 同名 Deployment 的复现、改动文件和回归验证 |
 | [`docs/README.md`](docs/README.md) | docs/ 与私人笔记目录的分工 |
 | [`scenarios/README.md`](scenarios/README.md) | kind 故障场景：用法、cases 协议、验收 |
 | [`aruing.example.yaml`](aruing.example.yaml) / [`tui.example.yaml`](tui.example.yaml) | 带注释的配置 / 主题参考 |

@@ -442,6 +442,26 @@ func (t *TowerResponder) Respond(ctx context.Context, in session.RespondInput) (
 			}
 			observations = append(observations, obs)
 			toolRounds++
+			if decision.ToolCall.ToolName == "k8s" &&
+				isAllNamespaceGetArguments(decision.ToolCall.Arguments) &&
+				obs.Error == "" && hasCrossNamespaceDuplicateNames(obs.Raw) {
+				seed, seedErr := t.namespaceClarificationSeed(obs, decision.ToolCall)
+				if seedErr != nil {
+					return session.RespondOutput{}, seedErr
+				}
+				clarified, suspended, clarifyErr := session.ClarifyNamespaceAmbiguity(
+					ctx, t.factory, t.executor, t.ledger, in.SessionID, in.UserText, seed,
+				)
+				if clarifyErr != nil {
+					return session.RespondOutput{}, clarifyErr
+				}
+				if suspended {
+					t.progressf("tower: suspend on duplicate namespace targets")
+					t.settleSuspensionAfterOutcome(ctx, in.SessionID, clarified)
+					clarified.CheckpointContent = view.CheckpointContent
+					return clarified, nil
+				}
+			}
 
 		case towerActionEscalate:
 			question := strings.TrimSpace(decision.Question)
@@ -492,6 +512,8 @@ type towerObservation struct {
 	TaskID string `json:"taskId"`
 	// 实际工具名
 	ToolName string `json:"toolName"`
+	// 工具报告的数据来源
+	Source string `json:"source,omitempty"`
 	// 调用目的
 	Purpose string `json:"purpose,omitempty"`
 	// 成功时的摘要
@@ -743,6 +765,7 @@ func (t *TowerResponder) executeBaselineTool(ctx context.Context, call towerTool
 
 	// 调度器已写入归属字段；观察取可回放子集，含完整原始输出（内存不阉割）
 	obs.Summary = item.Summary
+	obs.Source = item.Source
 	obs.CommandView = item.CommandView
 	if item.Error != "" {
 		obs.Error = item.Error
@@ -758,6 +781,44 @@ func (t *TowerResponder) executeBaselineTool(ctx context.Context, call towerTool
 		}
 	}
 	return obs, nil
+}
+
+func (t *TowerResponder) namespaceClarificationSeed(
+	obs towerObservation,
+	call towerToolCall,
+) (session.NamespaceClarificationSeed, error) {
+	if obs.TaskID == "" || obs.ToolName != "k8s" || len(obs.Raw) == 0 {
+		return session.NamespaceClarificationSeed{}, errors.New("tower: incomplete Kubernetes namespace observation")
+	}
+	evidenceID := obs.EvidenceID
+	if evidenceID == "" {
+		id, err := t.factory.NewID("e")
+		if err != nil {
+			return session.NamespaceClarificationSeed{}, fmt.Errorf("tower: create namespace evidence id: %w", err)
+		}
+		evidenceID = id
+	}
+	args := append(json.RawMessage(nil), call.Arguments...)
+	raw := append(json.RawMessage(nil), obs.Raw...)
+	return session.NamespaceClarificationSeed{
+		Tasks: []core.Task{{
+			ID:        obs.TaskID,
+			ToolName:  obs.ToolName,
+			Arguments: args,
+			Purpose:   obs.Purpose,
+		}},
+		Evidence: []core.Evidence{{
+			ID:          evidenceID,
+			TaskID:      obs.TaskID,
+			Source:      obs.Source,
+			ToolName:    obs.ToolName,
+			CommandView: obs.CommandView,
+			Summary:     obs.Summary,
+			Raw:         raw,
+			Error:       obs.Error,
+			CreatedAt:   t.factory.Now(),
+		}},
+	}, nil
 }
 
 // 生成写入提示词的观察副本，不修改环内权威切片
